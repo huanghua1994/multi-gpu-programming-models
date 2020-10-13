@@ -122,13 +122,18 @@ typedef float real;
 constexpr real tol = 1.0e-8;
 const real PI = 2.0 * std::asin(1.0);
 
+__global__ void complete_halo_exchange()
+{
+    nvshmem_quiet(); /* To ensure all prior nvshmem operations have been completed */
+}
+
 /* This kernel implements neighborhood synchronization for Jacobi. It updates
    the neighbor PEs about its arrival and waits for notification from them. */
 __global__ void syncneighborhood_kernel(int my_pe, int num_pes, volatile long* sync_arr,
                                         long counter) {
     int next_rank = (my_pe + 1) % num_pes;
     int prev_rank = (my_pe == 0) ? num_pes - 1 : my_pe - 1;
-    nvshmem_quiet(); /* To ensure all prior nvshmem operations have been completed */
+    //nvshmem_quiet(); /* To ensure all prior nvshmem operations have been completed */
 
     /* Notify neighbors about arrival */
     nvshmemx_long_signal((long*)sync_arr, counter, next_rank);
@@ -430,6 +435,14 @@ int main(int argc, char* argv[]) {
     cudaStreamSynchronize(compute_stream);
     long synccounter = 1;
 
+    double allreduce_s = 0.0, mpi_st, mpi_et;
+    float comp_ms = 0.0, comm_ms = 0.0, sync_ms = 0.0, comp_t, comm_t, sync_t;
+    cudaEvent_t comp_start, comm_start, sync_start, sync_end;
+    cudaEventCreate(&comp_start);
+    cudaEventCreate(&comm_start);
+    cudaEventCreate(&sync_start);
+    cudaEventCreate(&sync_end);
+
     while (l2_norm_greater_than_tol && iter < iter_max) {
         // on new iteration: old current vars are now previous vars, old
         // previous vars are no longer needed
@@ -437,17 +450,22 @@ int main(int argc, char* argv[]) {
         int curr = (iter + 1) % 2;
 
         CUDA_RT_CALL(cudaStreamWaitEvent(compute_stream, reset_l2_norm_done[curr], 0));
+        CUDA_RT_CALL(cudaEventRecord(comp_start, compute_stream));
         jacobi_kernel<dim_block_x, dim_block_y>
             <<<dim_grid, {dim_block_x, dim_block_y, 1}, 0, compute_stream>>>(
                 a_new, a, l2_norm_bufs[curr].d, iy_start, iy_end, nx, top_pe, iy_end_top, bottom_pe,
                 iy_start_bottom);
         CUDA_RT_CALL(cudaGetLastError());
 
+        CUDA_RT_CALL(cudaEventRecord(comm_start, compute_stream));
+        complete_halo_exchange<<<1, 1, 0, compute_stream>>>();
+        CUDA_RT_CALL(cudaEventRecord(sync_start, compute_stream));
         /* Instead of using nvshmemx_barrier_all_on_stream, we are using a custom implementation
            of barrier that just synchronizes with the neighbor PEs that is the PEs with whom a PE
            communicates. This will perform faster than a global barrier that would do redundant
            synchronization for this application. */
         syncneighborhood_kernel<<<1, 1, 0, compute_stream>>>(mype, npes, sync_arr, synccounter);
+        CUDA_RT_CALL(cudaEventRecord(sync_end, compute_stream));
         synccounter++;
 
         // perform L2 norm calculation
@@ -457,12 +475,27 @@ int main(int argc, char* argv[]) {
                                          cudaMemcpyDeviceToHost, compute_stream));
             CUDA_RT_CALL(cudaEventRecord(l2_norm_bufs[curr].copy_done, compute_stream));
 
+            CUDA_RT_CALL(cudaEventSynchronize(comp_start));
+            CUDA_RT_CALL(cudaEventSynchronize(comm_start));
+            CUDA_RT_CALL(cudaEventSynchronize(sync_start));
+            CUDA_RT_CALL(cudaEventSynchronize(sync_end));
+
             // ensure previous D2H-copy is completed before using the data for
             // calculation
             CUDA_RT_CALL(cudaEventSynchronize(l2_norm_bufs[prev].copy_done));
 
+            CUDA_RT_CALL(cudaEventElapsedTime(&comp_t, comp_start, comm_start));
+            CUDA_RT_CALL(cudaEventElapsedTime(&comm_t, comm_start, sync_start));
+            CUDA_RT_CALL(cudaEventElapsedTime(&sync_t, sync_start, sync_end));
+            comp_ms += comp_t;
+            comm_ms += comm_t;
+            sync_ms += sync_t;
+
+            mpi_st = MPI_Wtime();
             MPI_CALL(MPI_Allreduce(l2_norm_bufs[prev].h, &l2_norms[prev], 1, MPI_FLOAT, MPI_SUM,
                                    MPI_COMM_WORLD));
+            mpi_et = MPI_Wtime();
+            allreduce_s += mpi_et - mpi_st;
 
             l2_norms[prev] = std::sqrt(l2_norms[prev]);
             l2_norm_greater_than_tol = (l2_norms[prev] > tol);
@@ -482,6 +515,8 @@ int main(int argc, char* argv[]) {
         std::swap(a_new, a);
         iter++;
     }
+
+    printf("Rank %2d: comp, comm, sync, allreduce time = %.2f, %.2f, %.2f, %.2f ms\n", mype, comp_ms, comm_ms, sync_ms, allreduce_s * 1000.0);
 
     CUDA_RT_CALL(cudaDeviceSynchronize());
     nvshmem_barrier_all();

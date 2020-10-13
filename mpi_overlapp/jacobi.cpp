@@ -258,6 +258,12 @@ int main(int argc, char* argv[]) {
     bool calculate_norm;
     real l2_norm = 1.0;
 
+    float comp_t, comp_ms = 0.0;
+    double sendrecv_s = 0.0, allreduce_s = 0.0, mpi_st, mpi_et;
+    cudaEvent_t comp_start, comp_end;
+    cudaEventCreate(&comp_start);
+    cudaEventCreate(&comp_end);
+
     MPI_CALL(MPI_Barrier(MPI_COMM_WORLD));
     double start = MPI_Wtime();
     PUSH_RANGE("Jacobi solve", 0)
@@ -266,6 +272,7 @@ int main(int argc, char* argv[]) {
         CUDA_RT_CALL(cudaEventRecord(reset_l2norm_done, compute_stream));
 
         CUDA_RT_CALL(cudaStreamWaitEvent(push_top_stream, reset_l2norm_done, 0));
+        CUDA_RT_CALL(cudaEventRecord(comp_start, compute_stream));
         calculate_norm = (iter % nccheck) == 0 || (!csv && (iter % 100) == 0);
         launch_jacobi_kernel(a_new, a, l2_norm_d, iy_start, (iy_start + 1), nx, calculate_norm,
                              push_top_stream);
@@ -278,6 +285,7 @@ int main(int argc, char* argv[]) {
 
         launch_jacobi_kernel(a_new, a, l2_norm_d, (iy_start + 1), (iy_end - 1), nx, calculate_norm,
                              compute_stream);
+        CUDA_RT_CALL(cudaEventRecord(comp_end, compute_stream));
 
         if (calculate_norm) {
             CUDA_RT_CALL(cudaStreamWaitEvent(compute_stream, push_top_done, 0));
@@ -292,17 +300,32 @@ int main(int argc, char* argv[]) {
         // Apply periodic boundary conditions
         CUDA_RT_CALL(cudaStreamSynchronize(push_top_stream));
         PUSH_RANGE("MPI", 5)
+        mpi_st = MPI_Wtime();
         MPI_CALL(MPI_Sendrecv(a_new + iy_start * nx, nx, MPI_REAL_TYPE, top, 0,
                               a_new + (iy_end * nx), nx, MPI_REAL_TYPE, bottom, 0, MPI_COMM_WORLD,
                               MPI_STATUS_IGNORE));
+        mpi_et = MPI_Wtime();
+        sendrecv_s += mpi_et - mpi_st;
+
         CUDA_RT_CALL(cudaStreamSynchronize(push_bottom_stream));
+        mpi_st = MPI_Wtime();
         MPI_CALL(MPI_Sendrecv(a_new + (iy_end - 1) * nx, nx, MPI_REAL_TYPE, bottom, 0, a_new, nx,
                               MPI_REAL_TYPE, top, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+        mpi_et = MPI_Wtime();
+        sendrecv_s += mpi_et - mpi_st;
         POP_RANGE
 
         if (calculate_norm) {
+            CUDA_RT_CALL(cudaEventSynchronize(comp_start));
+            CUDA_RT_CALL(cudaEventSynchronize(comp_end));
+            CUDA_RT_CALL(cudaEventElapsedTime(&comp_t, comp_start, comp_end));
+            comp_ms += comp_t;
+
             CUDA_RT_CALL(cudaStreamSynchronize(compute_stream));
+            mpi_st = MPI_Wtime();
             MPI_CALL(MPI_Allreduce(l2_norm_h, &l2_norm, 1, MPI_REAL_TYPE, MPI_SUM, MPI_COMM_WORLD));
+            mpi_et = MPI_Wtime();
+            allreduce_s += mpi_et - mpi_st;
             l2_norm = std::sqrt(l2_norm);
 
             if (!csv && 0 == rank && (iter % 100) == 0) {
@@ -315,6 +338,8 @@ int main(int argc, char* argv[]) {
     }
     double stop = MPI_Wtime();
     POP_RANGE
+
+    printf("Rank %2d: comp, sendrecv, allreduce time = %.2f, %.2f, %.2f ms\n", rank, comp_ms, sendrecv_s * 1000, allreduce_s * 1000);
 
     CUDA_RT_CALL(cudaMemcpy(a_h + iy_start_global * nx, a + nx,
                             std::min((ny - iy_start_global) * nx, chunk_size * nx) * sizeof(real),
