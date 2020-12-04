@@ -201,6 +201,49 @@ __global__ void jacobi_kernel(real* __restrict__ const a_new, const real* __rest
 #endif  // HAVE_CUB
 }
 
+// This kernel is from multi-gpu-programming-models\single_gpu\jacobi.cu
+template <int BLOCK_DIM_X, int BLOCK_DIM_Y>
+__global__ void jacobi_kernel_single_gpu(
+    real* __restrict__ const a_new, const real* __restrict__ const a,
+    real* __restrict__ const l2_norm, const int iy_start, const int iy_end, const int nx
+) 
+{
+#ifdef HAVE_CUB
+    typedef cub::BlockReduce<real, BLOCK_DIM_X, cub::BLOCK_REDUCE_WARP_REDUCTIONS, BLOCK_DIM_Y>
+        BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+#endif  // HAVE_CUB
+    const int iy = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    const int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    real local_l2_norm = 0.0;
+
+    if (iy < iy_end) {
+        if (ix >= 1 && ix < (nx - 1)) {
+            const real new_val = 0.25 * (a[iy * nx + ix + 1] + a[iy * nx + ix - 1] +
+                                         a[(iy + 1) * nx + ix] + a[(iy - 1) * nx + ix]);
+            a_new[iy * nx + ix] = new_val;
+
+            // apply boundary conditions
+            if (iy_start == iy) {
+                a_new[iy_end * nx + ix] = new_val;
+            }
+
+            if ((iy_end - 1) == iy) {
+                a_new[(iy_start - 1) * nx + ix] = new_val;
+            }
+
+            real residue = new_val - a[iy * nx + ix];
+            local_l2_norm = residue * residue;
+        }
+    }
+#ifdef HAVE_CUB
+    real block_l2_norm = BlockReduce(temp_storage).Sum(local_l2_norm);
+    if (0 == threadIdx.y && 0 == threadIdx.x) atomicAdd(l2_norm, block_l2_norm);
+#else
+    atomicAdd(l2_norm, local_l2_norm);
+#endif  // HAVE_CUB
+}
+
 double single_gpu(const int nx, const int ny, const int iter_max, real* const a_ref_h,
                   const int nccheck, const bool print, int mype);
 
@@ -377,7 +420,16 @@ int main(int argc, char* argv[]) {
     int top_pe = mype > 0 ? mype - 1 : (npes - 1);
     int bottom_pe = (mype + 1) % npes;
 
+    #if 0
     int iy_end_top = (top_pe < num_ranks_low) ? chunk_size_low + 1 : chunk_size_high + 1;
+    #else
+    // The iy_end_top formula above seems to be buggy
+    int iy_end_top;
+    MPI_Sendrecv(
+        &iy_end,     1, MPI_INT, bottom_pe, 0, 
+        &iy_end_top, 1, MPI_INT, top_pe,    0, MPI_COMM_WORLD, MPI_STATUS_IGNORE
+    );
+    #endif
     int iy_start_bottom = 0;
 
     // Set diriclet boundary conditions on left and right boundary
@@ -628,8 +680,7 @@ double single_gpu(const int nx, const int ny, const int iter_max, real* const a_
 
     constexpr int dim_block_x = 1024;
     constexpr int dim_block_y = 1;
-    dim3 dim_grid((nx + dim_block_x - 1) / dim_block_x, ((ny - 2) + dim_block_y - 1) / dim_block_y,
-                  1);
+    dim3 dim_grid((nx + dim_block_x - 1) / dim_block_x, (ny + dim_block_y - 1) / dim_block_y, 1);
 
     int iter = 0;
     real l2_norm = 1.0;
@@ -641,9 +692,15 @@ double single_gpu(const int nx, const int ny, const int iter_max, real* const a_
     while (l2_norm > tol && iter < iter_max) {
         CUDA_RT_CALL(cudaMemsetAsync(l2_norm_d, 0, sizeof(real), compute_stream));
 
+        #if 0
         jacobi_kernel<dim_block_x, dim_block_y>
             <<<dim_grid, {dim_block_x, dim_block_y, 1}, 0, compute_stream>>>(
                 a_new, a, l2_norm_d, iy_start, iy_end, nx, mype, iy_end + 1, mype, (iy_start - 1));
+        #else 
+        jacobi_kernel_single_gpu<dim_block_x, dim_block_y>
+            <<<dim_grid, {dim_block_x, dim_block_y, 1}, 0, compute_stream>>>(
+                a_new, a, l2_norm_d, iy_start, iy_end, nx);
+        #endif
         CUDA_RT_CALL(cudaGetLastError());
 
         if ((iter % nccheck) == 0 || (print && ((iter % 100) == 0))) {
